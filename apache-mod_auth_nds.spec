@@ -24,6 +24,7 @@ BuildRequires:	apache-devel >= 2.2.0
 BuildRequires:	ncpfs-devel
 BuildRequires:	file
 Epoch:		1
+BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-buildroot
 
 %description
 mod_auth_nds is the Novell(tm) NDS(tm) authentication module for 
