@@ -1,0 +1,470 @@
+--- mod_auth_nds.c	2002-09-25 02:25:36.000000000 +0200
++++ mod_auth_nds.c.oden	2005-12-15 22:40:25.000000000 +0100
+@@ -26,6 +26,10 @@
+  * Contributors:
+  * Clifton Woolley <jwoolley@wlu.edu>
+  *
++ * apache1 code removal, apr 1.2.2 and apache 2.2.0 fixes by:
++ * Oden Eriksson <oeriksson@mandriva.com>
++ *
++ *
+  */
+ 
+ /* module configuration hints
+@@ -48,7 +52,6 @@
+ #include "http_protocol.h"
+ #include "http_request.h"
+ #include "apr_strings.h"
+-#include "apr_compat.h"
+ 
+ #define log_debug(msg) ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, \
+                                     0, r->server, msg)
+@@ -68,74 +71,21 @@
+     struct ncp_conn *conn;
+ } nds_auth_config_rec;
+ 
+-#if defined(EAPI) && defined(EAPI_MM)
+-struct {
+-    int on;
+-    int fdns;           /* are we caching name->FDN mappings? */
+-    time_t ttl;         /* TTL in seconds for cache entries */
+-    table *password;    /* username -> md5 encrypted password */
+-    table *time;        /* username -> last update time */
+-    table *fdn;         /* contextless name -> FDN */
+-} nds_cache = {
+-    TRUE,               /* must be initialised to TRUE */
+-    FALSE,
+-    300,
+-    NULL,
+-    NULL,
+-    NULL
+-};
+-
+-/* global var(s) */
+-pool *sp;
+-#endif
+-
+-
+-static void nds_auth_init(server_rec *s, apr_pool_t *p)
+-{
+-
+-#if defined(EAPI) && defined(EAPI_MM)
+-
+-    if (nds_cache.on == FALSE) {
+-        ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_INFO, 0, s,
+-                     "NDSCache: cache disabled in configuration");
+-        return;
+-    }
+-
+-    nds_cache.on = ap_shared_pool_possible();
+-
+-    if (nds_cache.on == TRUE) {
+-        ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_INFO, 0, s,
+-            "NDSCache: Status -> ON");
+-    } else {
+-        ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_WARNING, 0, s,
+-            "NDSCache: Status -> OFF -- could not initialize shared pool");
+-        return;
+-    }
+-
+-    sp = ap_make_shared_sub_pool(p);
+-
+-    nds_cache.password  = ap_make_table(sp, 75);
+-    nds_cache.time      = ap_make_table(sp, 75);
+-    if (nds_cache.fdns == TRUE)
+-        nds_cache.fdn   = ap_make_table(sp, 75);
+-
+-    srand((int)time(NULL));
+-#endif
+ 
++static void nds_auth_init(server_rec *s, apr_pool_t *p) {
+ }
+ 
+-
+ static void *nds_auth_crdconf(apr_pool_t * p, char *d)
+ {
+-    nds_auth_config_rec *sec = ap_pcalloc(p, sizeof(nds_auth_config_rec));
++    nds_auth_config_rec *sec = apr_pcalloc(p, sizeof(nds_auth_config_rec));
+     sec->auth_authoritative = 1;    /* let's be authoritative by default */
+     sec->require_pass  = 0;         /* allow empty passwords */
+     sec->require_ssl = 1;           /* require SSL connection */
+     sec->context_override   = 1;    /* include parent's search list by default*/
+     sec->auth_expired_uri = NULL;
+     sec->auth_failmessage = NULL;
+-    sec->auth_servers = ap_make_array(p, 3, sizeof(char *));
+-    sec->contexts = ap_make_array(p, 1, sizeof(char *));
++    sec->auth_servers = apr_array_make(p, 3, sizeof(char *));
++    sec->contexts = apr_array_make(p, 1, sizeof(char *));
+     sec->conn = NULL;
+ 
+     return sec;
+@@ -146,7 +96,7 @@
+ {
+     nds_auth_config_rec *parent = (nds_auth_config_rec *) parentv;
+     nds_auth_config_rec *child  = (nds_auth_config_rec *) childv;
+-    nds_auth_config_rec *new    = (nds_auth_config_rec *)ap_pcalloc
++    nds_auth_config_rec *new    = (nds_auth_config_rec *)apr_pcalloc
+                                   (p, sizeof(nds_auth_config_rec));
+ 
+     new->auth_authoritative = child->auth_authoritative;
+@@ -164,7 +114,7 @@
+                                 ? child->contexts
+                                 : (child->contexts == NULL)
+                                 ? parent->contexts
+-                                : ap_append_arrays(p,parent->contexts,
++                                : apr_array_append(p,parent->contexts,
+                                                     child->contexts);
+ 
+     new->auth_expired_uri = (child->auth_expired_uri == NULL)
+@@ -174,110 +124,6 @@
+     return (void *)new;
+ }
+ 
+-
+-#if defined(EAPI) && defined(EAPI_MM)
+-static int nds_cache_check(const char *username, const char *password, request_rec *r)
+-{
+-    int retval = 0;
+-    char *lcpass;
+-    const char *c_pass;
+-    time_t c_time;
+-    ap_pool_lock_mode lock_mode = AP_POOL_RD;
+-
+-    lcpass = apr_pstrdup(r->pool, password);
+-    ap_str_tolower(lcpass);
+-
+-    ap_acquire_pool(sp, lock_mode);
+-    c_pass = ap_table_get(nds_cache.password, username);
+-    c_time = (time_t)ap_table_get(nds_cache.time, username);
+-
+-    if (c_pass != NULL) {
+-        if (ap_validate_password(lcpass, c_pass) == NULL) {
+-            /* cached password matches, now check time */
+-            if ((time(NULL) - c_time) <= nds_cache.ttl) {
+-                retval = 1; /* success */
+-            }
+-        }
+-    }
+-
+-    ap_release_pool(sp);
+-
+-    return (retval);
+-}
+-
+-
+-static void nds_cache_add(char *username, const char *password, request_rec *r)
+-{
+-    char *lcpass;
+-    char salt[9];
+-    char hash[120];
+-    ap_pool_lock_mode lock_mode = AP_POOL_RW;
+-
+-    lcpass = apr_pstrdup(r->pool, password);
+-    ap_str_tolower(lcpass);
+-
+-    ap_to64(&salt[0], rand(), 8);
+-    salt[8] = '\0';
+-    ap_MD5Encode((const unsigned char *)lcpass, (const unsigned char *)salt,
+-                hash, sizeof(hash));
+-
+-    ap_acquire_pool(sp, lock_mode);
+-    ap_table_set(nds_cache.password, username, hash);
+-    ap_table_setn(nds_cache.time, apr_pstrdup(sp, username), (char *)time(NULL));
+-
+-    ap_release_pool(sp);
+-}
+-
+-
+-static void nds_cache_purge(request_rec *r)
+-{
+-    ap_pool_lock_mode lock_mode = AP_POOL_RW;
+-    array_header *arr, *fdn_arr;
+-    int i, j;
+-    time_t c_time;
+-    table_entry *te, *fdn_te;
+-
+-    ap_acquire_pool(sp, lock_mode);
+-    arr = ap_table_elts(nds_cache.time);
+-    te = (table_entry *)arr->elts;
+-
+-    for (i = 0; i < arr->nelts; i++) {
+-        if (!te[i].key)
+-            continue;
+-        c_time = (time_t)te[i].val;
+-
+-        if ((nds_cache.ttl - (time(NULL) - c_time)) <= 0) {
+-            if (nds_cache.fdns == TRUE) {
+-                fdn_arr = ap_table_elts(nds_cache.fdn);
+-                fdn_te = (table_entry *)fdn_arr->elts;
+-                for (j = 0; j < fdn_arr->nelts; j++) {
+-                    if (!fdn_te[j].key)
+-                        continue;
+-                    if (strcmp(te[i].key, fdn_te[j].val) == 0) {
+-                        ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0,
+-                                     r->server, "NDSCache: deleting expired "
+-                                     "name->FDN mapping: %s to %s",
+-                                     fdn_te[j].key, fdn_te[j].val);
+-                        ap_table_unset(nds_cache.fdn, fdn_te[j].key);
+-                        j = -1;
+-                        continue;
+-                    }
+-                }
+-            }
+-            ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, r->server,
+-                "NDSCache: deleting expired entry for %s", te[i].key);
+-            ap_table_unset(nds_cache.time, te[i].key);
+-            ap_table_unset(nds_cache.password, te[i].key);
+-        }
+-    }
+-
+-    ap_release_pool(sp);
+-
+-    return;
+-}
+-#endif
+-
+-
+ static int is_valid_user(request_rec *r, char *user, char *userfile)
+ {
+     ap_configfile_t *f;
+@@ -318,43 +164,20 @@
+ static const char *nds_cache_set_timeout(cmd_parms *cmd, nds_auth_config_rec
+                                          *struct_ptr, char *arg)
+ {
+-#if defined(EAPI) && defined(EAPI_MM)
+-    time_t ttl = atoi(arg);
+-
+-    nds_cache.ttl = ttl;
+-
+-    if (ttl <= 0)
+-        nds_cache.on = FALSE;
+-
+-    return NULL;
+-
+-#else
+     return "AuthNDSCacheTimeout: You must compile w/ EAPI+MM to use the cache!";
+-#endif
+ }
+ 
+ 
+ static const char *nds_cache_set_unique_cns(cmd_parms *cmd, nds_auth_config_rec
+                                             *struct_ptr, char *arg)
+ {
+-#if defined(EAPI) && defined(EAPI_MM)
+-
+-    if (arg)
+-        nds_cache.fdns = TRUE;
+-    else
+-        nds_cache.fdns = FALSE;
+-
+-    return NULL;
+-
+-#else
+     return "AuthNDSUniqueCNs: You must compile w/ EAPI+MM to use the cache!";
+-#endif
+ }
+ 
+ 
+ static const char *add_server(cmd_parms *cmd, nds_auth_config_rec *struct_ptr, char *arg)
+ {
+-    char **ptr = (char **)ap_push_array(struct_ptr->auth_servers);
++    char **ptr = (char **)apr_array_push(struct_ptr->auth_servers);
+     *ptr = apr_pstrdup(cmd->pool, arg);
+     return NULL;
+ }
+@@ -362,7 +185,7 @@
+ 
+ static const char *add_search_context(cmd_parms *cmd, nds_auth_config_rec *struct_ptr, char *arg)
+ {
+-    char **ptr = (char **)ap_push_array(struct_ptr->contexts);
++    char **ptr = (char **)apr_array_push(struct_ptr->contexts);
+     *ptr = apr_pstrdup(cmd->pool, arg);
+     return NULL;
+ }
+@@ -378,12 +201,6 @@
+         ncp_close(sec->conn);
+         sec->conn = NULL;
+     }
+-
+-#if defined(EAPI) && defined(EAPI_MM)
+-    if (nds_cache.on == TRUE)
+-        nds_cache_purge(r);
+-#endif
+-
+ }
+ 
+ 
+@@ -406,9 +223,6 @@
+     char *uname;
+     char server[NW_MAX_SERVER_NAME_LEN];
+     char *ssl_on = NULL;
+-#if defined(EAPI) && defined(EAPI_MM)
+-    char *s = NULL;
+-#endif
+ 
+ //    ap_register_cleanup(r->pool, (void *)r, cleanup_handler, ap_null_cleanup);
+ 
+@@ -419,7 +233,7 @@
+     if (sec->require_ssl && sec->auth_failmessage)
+         ap_custom_response(r, HTTP_FORBIDDEN, sec->auth_failmessage);
+ 
+-    ssl_on = (char*)ap_table_get (r->subprocess_env, "HTTPS");
++    ssl_on = (char*)apr_table_get (r->subprocess_env, "HTTPS");
+     /* Check if SSL is required */
+     if ((sec->require_ssl) && !ssl_on) {
+         ap_log_rerror(APLOG_MARK, APLOG_NOERRNO | APLOG_ERR, 0, r,"SSL connection required");
+@@ -460,37 +274,6 @@
+         return HTTP_UNAUTHORIZED;
+     }
+ 
+-#if defined(EAPI) && defined(EAPI_MM)
+-    if (nds_cache.on == TRUE) {
+-        ap_pool_lock_mode lock_mode = AP_POOL_RD;
+-        if ((*r->user != '.') && (nds_cache.fdns == TRUE)) {
+-            /* check for name->FDN match */
+-            ap_acquire_pool(sp, lock_mode);
+-            s = apr_pstrdup(r->pool, ap_table_get(nds_cache.fdn, r->user));
+-            ap_release_pool(sp);
+-            if (s == NULL) {
+-                /* the cache only contains FDNs, so there's no point */
+-                goto SKIP_PW_CHECK;
+-            } else {
+-                ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, r->server,
+-                             "NDSCache: FDN %s found for %s", s, r->user);
+-                r->user = s;
+-            }
+-        }
+-
+-        if (nds_cache_check(r->user, sent_pw, r)) {
+-            ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, r->server,
+-                "NDSCache: passwords match for %s", r->user);
+-            goto SUCCESS;
+-        } else {
+-            ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, r->server,
+-                "NDSCache: no password match for %s", r->user);
+-        }
+-    }
+-
+-    SKIP_PW_CHECK:
+-#endif
+-
+     /* has a server been specified or do we need to find one? */
+     if (sec->auth_servers->nelts != 0) {
+         servers = (char **)sec->auth_servers->elts;
+@@ -546,8 +329,8 @@
+         uname = (*r->user == '.')
+                 ? r->user
+                 : (*contexts[i] == '.')
+-                    ? ap_pstrcat(r->pool, ".", r->user, contexts[i], NULL)
+-                    : ap_pstrcat(r->pool, ".", r->user, ".", contexts[i], NULL);
++                    ? apr_pstrcat(r->pool, ".", r->user, contexts[i], NULL)
++                    : apr_pstrcat(r->pool, ".", r->user, ".", contexts[i], NULL);
+         ++uname;
+ 
+         if (strlen(uname) >= sizeof(user_u) / sizeof(unsigned short)) {
+@@ -567,37 +350,6 @@
+         if (!err) {
+             ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, r,
+                 "Found FDN %s for %s", uname, r->user);
+-#if defined(EAPI) && defined(EAPI_MM)
+-            if ((nds_cache.on == TRUE) && (*r->user != '.')) {
+-                ap_pool_lock_mode lock_mode = AP_POOL_RD;
+-                if (nds_cache.fdns == TRUE) {
+-                    lock_mode = AP_POOL_RW;
+-                    ap_acquire_pool(sp, lock_mode);
+-                    ap_table_set(nds_cache.fdn, r->user, uname);
+-                    ap_release_pool(sp);
+-                    ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0,
+-                                 r->server, "NDSCache: cached FDN %s for %s",
+-                                 uname, r->user);
+-                }
+-
+-                lock_mode = AP_POOL_RD;
+-                ap_acquire_pool(sp, lock_mode);
+-
+-                if (nds_cache_check(uname, sent_pw, r)) {
+-                    ap_release_pool(sp);
+-                    ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0,
+-                                 r->server, "NDSCache: passwords match for %s",
+-                                 uname);
+-                    goto SUCCESS;
+-                } else {
+-                     ap_release_pool(sp);
+-                     ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0,
+-                                  r->server,
+-                                  "NDSCache: no password match for %s",
+-                                  uname);
+-                }
+-            }
+-#endif
+             r->user = uname;
+             break;
+         }
+@@ -632,8 +384,7 @@
+                 ap_log_rerror(APLOG_MARK, APLOG_NOERRNO | APLOG_ERR, 0, r, "user %s restricted from this address: %s", r->user, r->uri);
+                 break;
+             case (NWE_ACCT_DISABLED):
+-                ap_log_rerror(APLOG_MARK, APLOG_NOERRNO | APLOG_ERR, 0, r, "user %s
+- account disabled: %s", r->user, r->uri);
++                ap_log_rerror(APLOG_MARK, APLOG_NOERRNO | APLOG_ERR, 0, r, "user %s account disabled: %s", r->user, r->uri);
+                 break;
+             case (NWE_PASSWORD_INVALID):
+                 ap_log_rerror(APLOG_MARK, APLOG_NOERRNO | APLOG_ERR, 0, r, "user %s password expired & no grace logins: %s", r->user, r->uri);
+@@ -655,15 +406,7 @@
+             return HTTP_UNAUTHORIZED;
+         }
+ 
+-#if defined(EAPI) && defined(EAPI_MM)
+-        if (nds_cache.on == TRUE) {
+-            nds_cache_add(r->user, sent_pw, r);
+-            ap_log_error(APLOG_MARK, APLOG_NOERRNO|APLOG_DEBUG, 0, r->server,
+-                "NDSCache: %s added to cache", r->user);
+-        }
+-        SUCCESS:
+-#endif
+-        ap_table_set(r->subprocess_env, "AUTH_USERDN", r->user);
++        apr_table_set(r->subprocess_env, "AUTH_USERDN", r->user);
+         log_debug("Authentication successful");
+         return OK;
+ 
+@@ -788,33 +531,33 @@
+ static const command_rec nds_auth_cmds[] =
+ {
+     AP_INIT_TAKE1("AuthNDSUserFile", ap_set_file_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, auth_userfile),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, auth_userfile),
+      OR_AUTHCFG, "text file containing acceptable usernames"),
+     AP_INIT_TAKE12("AuthNDSServer", add_server, NULL, 
+      OR_AUTHCFG, "List of NetWare servers to authenticate to"),
+     AP_INIT_FLAG("AuthNDSAuthoritative", ap_set_flag_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, auth_authoritative),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, auth_authoritative),
+      OR_AUTHCFG, "If set to 'Off', access control will be passed to lower modules if the UserID is unknown to this module"),
+     AP_INIT_FLAG("AuthNDSRequirePW", ap_set_flag_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, require_pass),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, require_pass),
+      OR_AUTHCFG, "If set to 'On', users with blank passwords cannot authenticate."),
+     AP_INIT_FLAG("AuthNDSRequireSSL", ap_set_flag_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, require_ssl),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, require_ssl),
+      OR_AUTHCFG, "If set to 'On', SSL connection to the browser must be established."),
+     AP_INIT_TAKE1("AuthNDSExpiredURI", ap_set_string_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, auth_expired_uri),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, auth_expired_uri),
+      OR_AUTHCFG, "If set, users with expired passwords will be redirected to this URI"),
+     AP_INIT_TAKE12("AuthNDSContext", add_search_context, NULL, 
+      OR_AUTHCFG, "Adds search context(s) for contextless logins"),
+     AP_INIT_FLAG("AuthNDSContextOverride", ap_set_flag_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, context_override),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, context_override),
+      OR_AUTHCFG, "If set to 'On', parent's search contexts will be ignored." ),
+     AP_INIT_TAKE1("AuthNDSCacheTimeout", nds_cache_set_timeout, NULL,
+       RSRC_CONF, "Timeout (in seconds) for NDS user->password cache"),
+     AP_INIT_FLAG("AuthNDSUniqueCNs", nds_cache_set_unique_cns, NULL,
+      RSRC_CONF, "If set, CN->FDN results will be cached"),
+     AP_INIT_TAKE1("AuthNDSFailMessage", ap_set_string_slot,
+-     (void *) APR_XtOffsetOf(nds_auth_config_rec, auth_failmessage),
++     (void *) APR_OFFSETOF(nds_auth_config_rec, auth_failmessage),
+      OR_AUTHCFG, "text message or redirect URL when authorization failure occurs"),
+     {NULL}
+ };
