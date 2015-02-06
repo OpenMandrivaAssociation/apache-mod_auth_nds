@@ -6,7 +6,7 @@
 Summary:	DSO module for the apache Web server
 Name:		apache-%{mod_name}
 Version:	2.0
-Release:	16
+Release:	17
 Group:		System/Servers
 License:	GPL
 URL:		http://www.gknw.com/development/apache/
