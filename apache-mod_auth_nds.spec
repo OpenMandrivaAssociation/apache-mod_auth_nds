@@ -9,7 +9,7 @@ Version:	2.0
 Release:	17
 Group:		System/Servers
 License:	GPL
-URL:		http://www.gknw.com/development/apache/
+URL:		https://www.gknw.com/development/apache/
 Source0: 	http://www.gknw.com/development/apache/httpd-2.0/unix/modules/%{mod_name}-%{version}beta.tar.bz2
 Source1:	%{mod_conf}.bz2
 Patch0:		mod_auth_nds-2.0-register.patch
